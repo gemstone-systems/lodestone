@@ -7,3 +7,5 @@ Lodestone is a simple AT-URI resolver
 im lazy let me write it later
 
 i vibe coded this in like 15 mins lets hope it works lol
+
+`curl "https://lodestone.sylfr.dev/resolve?uri=at://...`
