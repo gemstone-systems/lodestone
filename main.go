@@ -28,9 +28,9 @@ const (
 	didCacheSize  = 4096
 	xrpcCacheSize = 8192
 
-	didTTL         = 12 * time.Hour
+	didTTL          = 12 * time.Hour
 	describeRepoTTL = 30 * time.Minute
-	getRecordTTL   = 2 * time.Minute
+	getRecordTTL    = 2 * time.Minute
 	// listRecords is intentionally not cached — it goes stale too easily.
 )
 
@@ -54,6 +54,21 @@ func initCaches() error {
 	return nil
 }
 
+func withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
 // -- Types -------------------------------------------------------------------
 
 type DIDDocument struct {
@@ -74,7 +89,7 @@ func main() {
 		panic(err)
 	}
 
-	http.HandleFunc("/resolve", handleResolve)
+	http.HandleFunc("/resolve", withCORS(handleResolve))
 	fmt.Println("Lodestone starting on :8080...")
 	http.ListenAndServe(":8080", nil)
 }
