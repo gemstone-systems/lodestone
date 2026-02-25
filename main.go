@@ -224,4 +224,3 @@ func getRecord(pdsEndpoint, did, collection, rkey string) ([]byte, error) {
 
 	return io.ReadAll(resp.Body)
 }
-
