@@ -1,0 +1,76 @@
+{
+  "lexicon": 1,
+  "id": "dev.sylfr.lodestone.resolve",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "Resolves one or more AT-URIs to their underlying records via the appropriate PDS. Accepts either a single `uri` parameter for backwards compatibility, or one or more `uris` parameters for batch resolution.",
+      "parameters": {
+        "type": "params",
+        "properties": {
+          "uri": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "Deprecated: prefer `uris` for all resolutions. Retained for backwards compatibility. Returns the record object directly rather than a wrapped array."
+          },
+          "uris": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "at-uri"
+            },
+            "maxLength": 25,
+            "description": "One or more AT-URIs to resolve in batch. Returns an ordered array of record objects, with an empty object in place of any failed resolutions."
+          }
+        }
+      },
+      "output": {
+        "encoding": "application/json",
+        "schema": {
+          "type": "union",
+          "refs": ["#singleResult", "#batchResult"]
+        }
+      },
+      "errors": [
+        {
+          "name": "MissingParam",
+          "description": "Neither `uri` nor `uris` was provided."
+        },
+        {
+          "name": "InvalidAtUri",
+          "description": "One or more of the provided AT-URIs could not be parsed."
+        },
+        {
+          "name": "HandleResolutionFailed",
+          "description": "A handle in the provided AT-URI could not be resolved to a DID."
+        },
+        {
+          "name": "DidResolutionFailed",
+          "description": "The DID could not be resolved to a DID document."
+        },
+        {
+          "name": "NoPdsEndpoint",
+          "description": "The resolved DID document contained no valid AtprotoPersonalDataServer service endpoint."
+        }
+      ]
+    },
+    "singleResult": {
+      "type": "unknown",
+      "description": "Deprecated: returned when resolving via the legacy `uri` parameter. Prefer `uris` and `#batchResult` for all new integrations."
+    },
+    "batchResult": {
+      "type": "object",
+      "description": "Returned when resolving via the `uris` parameter.",
+      "required": ["results"],
+      "properties": {
+        "results": {
+          "type": "array",
+          "description": "Ordered array of resolved records, positionally matching the input `uris`. Failed resolutions are represented as empty objects.",
+          "items": {
+            "type": "unknown"
+          }
+        }
+      }
+    }
+  }
+}
