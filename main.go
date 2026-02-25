@@ -8,7 +8,53 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2"
 )
+
+// -- Cache setup -------------------------------------------------------------
+
+type cacheEntry struct {
+	data      []byte
+	expiresAt time.Time
+}
+
+func (e cacheEntry) expired() bool {
+	return time.Now().After(e.expiresAt)
+}
+
+const (
+	didCacheSize  = 4096
+	xrpcCacheSize = 8192
+
+	didTTL         = 12 * time.Hour
+	describeRepoTTL = 30 * time.Minute
+	getRecordTTL   = 2 * time.Minute
+	// listRecords is intentionally not cached — it goes stale too easily.
+)
+
+var (
+	// didCache stores resolved DID documents, keyed by DID string.
+	didCache *lru.Cache[string, cacheEntry]
+	// xrpcCache stores PDS XRPC responses, keyed by the full request URL.
+	xrpcCache *lru.Cache[string, cacheEntry]
+)
+
+func initCaches() error {
+	var err error
+	didCache, err = lru.New[string, cacheEntry](didCacheSize)
+	if err != nil {
+		return fmt.Errorf("failed to create DID cache: %w", err)
+	}
+	xrpcCache, err = lru.New[string, cacheEntry](xrpcCacheSize)
+	if err != nil {
+		return fmt.Errorf("failed to create XRPC cache: %w", err)
+	}
+	return nil
+}
+
+// -- Types -------------------------------------------------------------------
 
 type DIDDocument struct {
 	ID      string    `json:"id"`
@@ -21,17 +67,23 @@ type Service struct {
 	ServiceEndpoint string `json:"serviceEndpoint"`
 }
 
+// -- Entry point -------------------------------------------------------------
+
 func main() {
+	if err := initCaches(); err != nil {
+		panic(err)
+	}
+
 	http.HandleFunc("/resolve", handleResolve)
 	fmt.Println("Lodestone starting on :8080...")
 	http.ListenAndServe(":8080", nil)
 }
 
+// -- Handler -----------------------------------------------------------------
+
 func handleResolve(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
-	// Collect URIs from both `uri` (singular) and `uris` (plural, repeatable).
-	// e.g. ?uris=at://foo&uris=at://bar or the legacy ?uri=at://foo
 	uris := query["uris"]
 	if singular := query.Get("uri"); singular != "" {
 		uris = append(uris, singular)
@@ -60,8 +112,6 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
-	// If only a single URI was provided via the legacy `uri` param, unwrap the
-	// array and return the object directly to preserve backwards compatibility.
 	w.Header().Set("Content-Type", "application/json")
 	if len(uris) == 1 && query.Get("uri") != "" {
 		w.Write(results[0])
@@ -71,7 +121,8 @@ func handleResolve(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(results)
 }
 
-// resolveATURI contains the core resolution logic, extracted from handleResolve.
+// -- Core resolution ---------------------------------------------------------
+
 func resolveATURI(atURI string) ([]byte, error) {
 	authority, collection, rkey, err := parseATURI(atURI)
 	if err != nil {
@@ -109,9 +160,7 @@ func parseATURI(uri string) (authority, collection, rkey string, err error) {
 		return "", "", "", fmt.Errorf("URI must start with at://")
 	}
 
-	path := strings.TrimPrefix(uri, "at://")
-	parts := strings.Split(path, "/")
-
+	parts := strings.Split(strings.TrimPrefix(uri, "at://"), "/")
 	if len(parts) < 1 {
 		return "", "", "", fmt.Errorf("missing authority")
 	}
@@ -127,6 +176,8 @@ func parseATURI(uri string) (authority, collection, rkey string, err error) {
 	return authority, collection, rkey, nil
 }
 
+// -- DID / handle resolution (cached) ----------------------------------------
+
 func resolveHandle(handle string) (string, error) {
 	resp, err := http.Get(fmt.Sprintf("https://%s/.well-known/atproto-did", handle))
 	if err == nil && resp.StatusCode == 200 {
@@ -136,13 +187,18 @@ func resolveHandle(handle string) (string, error) {
 			return strings.TrimSpace(string(body)), nil
 		}
 	}
-
 	return "", fmt.Errorf("could not resolve handle")
 }
 
 func resolveDID(did string) (*DIDDocument, error) {
-	var didURL string
+	if entry, ok := didCache.Get(did); ok && !entry.expired() {
+		var doc DIDDocument
+		if err := json.Unmarshal(entry.data, &doc); err == nil {
+			return &doc, nil
+		}
+	}
 
+	var didURL string
 	if strings.HasPrefix(did, "did:plc:") {
 		didURL = fmt.Sprintf("https://plc.directory/%s", did)
 	} else if strings.HasPrefix(did, "did:web:") {
@@ -162,10 +218,17 @@ func resolveDID(did string) (*DIDDocument, error) {
 		return nil, fmt.Errorf("DID resolution failed with status %d", resp.StatusCode)
 	}
 
-	var didDoc DIDDocument
-	if err := json.NewDecoder(resp.Body).Decode(&didDoc); err != nil {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
 		return nil, err
 	}
+
+	var didDoc DIDDocument
+	if err := json.Unmarshal(raw, &didDoc); err != nil {
+		return nil, err
+	}
+
+	didCache.Add(did, cacheEntry{data: raw, expiresAt: time.Now().Add(didTTL)})
 
 	return &didDoc, nil
 }
@@ -180,47 +243,65 @@ func extractPDSEndpoint(didDoc *DIDDocument) string {
 	return ""
 }
 
-func describeRepo(pdsEndpoint, did string) ([]byte, error) {
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.describeRepo?repo=%s",
-		strings.TrimSuffix(pdsEndpoint, "/"),
-		url.QueryEscape(did))
+// -- XRPC calls (selectively cached) -----------------------------------------
 
-	resp, err := http.Get(url)
+func cachedGet(cacheKey string, ttl time.Duration) ([]byte, bool) {
+	if ttl == 0 {
+		return nil, false
+	}
+	if entry, ok := xrpcCache.Get(cacheKey); ok && !entry.expired() {
+		return entry.data, true
+	}
+	return nil, false
+}
+
+func cacheSet(cacheKey string, data []byte, ttl time.Duration) {
+	if ttl == 0 {
+		return
+	}
+	xrpcCache.Add(cacheKey, cacheEntry{data: data, expiresAt: time.Now().Add(ttl)})
+}
+
+func fetchAndCache(requestURL, cacheKey string, ttl time.Duration) ([]byte, error) {
+	if data, hit := cachedGet(cacheKey, ttl); hit {
+		return data, nil
+	}
+
+	resp, err := http.Get(requestURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	cacheSet(cacheKey, data, ttl)
+	return data, nil
+}
+
+func describeRepo(pdsEndpoint, did string) ([]byte, error) {
+	u := fmt.Sprintf("%s/xrpc/com.atproto.repo.describeRepo?repo=%s",
+		strings.TrimSuffix(pdsEndpoint, "/"),
+		url.QueryEscape(did))
+	return fetchAndCache(u, u, describeRepoTTL)
 }
 
 func listRecords(pdsEndpoint, did, collection string) ([]byte, error) {
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s",
+	u := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s",
 		strings.TrimSuffix(pdsEndpoint, "/"),
 		url.QueryEscape(did),
 		url.QueryEscape(collection))
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	return io.ReadAll(resp.Body)
+	return fetchAndCache(u, u, 0) // ttl=0 skips cache entirely
 }
 
 func getRecord(pdsEndpoint, did, collection, rkey string) ([]byte, error) {
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=%s&rkey=%s",
+	u := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=%s&rkey=%s",
 		strings.TrimSuffix(pdsEndpoint, "/"),
 		url.QueryEscape(did),
 		url.QueryEscape(collection),
 		url.QueryEscape(rkey))
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	return io.ReadAll(resp.Body)
+	return fetchAndCache(u, u, getRecordTTL)
 }
