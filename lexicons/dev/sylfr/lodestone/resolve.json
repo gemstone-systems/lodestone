@@ -54,20 +54,38 @@
         }
       ]
     },
+    "record": {
+      "type": "object",
+      "description": "A resolved AT-URI record, matching the shape of com.atproto.repo.getRecord output.",
+      "required": ["uri", "value"],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "at-uri"
+        },
+        "cid": {
+          "type": "string",
+          "format": "cid"
+        },
+        "value": {
+          "type": "unknown"
+        }
+      }
+    },
     "singleResult": {
-      "type": "unknown",
-      "description": "Deprecated: returned when resolving via the legacy `uri` parameter. Prefer `uris` and `#batchResult` for all new integrations."
+      "type": "ref",
+      "ref": "#record",
+      "description": "Deprecated: returned when resolving via the legacy `uri` parameter."
     },
     "batchResult": {
       "type": "object",
-      "description": "Returned when resolving via the `uris` parameter.",
       "required": ["results"],
       "properties": {
         "results": {
           "type": "array",
-          "description": "Ordered array of resolved records, positionally matching the input `uris`. Failed resolutions are represented as empty objects.",
           "items": {
-            "type": "unknown"
+            "type": "ref",
+            "ref": "#record"
           }
         }
       }
